@@ -11,7 +11,7 @@ import type { PermissionState } from "#src/types";
 
 /** Minimal subset of BeforeAgentStartEvent used by this handler. */
 interface BeforeAgentStartPayload {
-  systemPrompt: string;
+  systemPrompt: string | readonly string[];
 }
 
 /**
@@ -57,6 +57,13 @@ export class AgentPrepHandler {
     event: BeforeAgentStartPayload,
     ctx: ExtensionContext,
   ): Promise<BeforeAgentStartEventResult> {
+    // omp passes systemPrompt as an array of parts; Pi passes one string.
+    const systemPrompt = (
+      typeof event.systemPrompt === "string"
+        ? event.systemPrompt
+        : event.systemPrompt.join("\n\n")
+    ).replace(/\r\n/g, "\n");
+
     // Fire-and-forget: warming is idempotent and best-effort, so it never
     // delays agent start. A bash advisory query before it completes falls back
     // to whole-string matching.
@@ -64,7 +71,7 @@ export class AgentPrepHandler {
     this.session.activate(ctx);
     this.session.refreshConfig(ctx);
 
-    const agentName = this.session.resolveAgentName(ctx, event.systemPrompt);
+    const agentName = this.session.resolveAgentName(ctx, systemPrompt);
     const activeTools = this.toolRegistry.getActive();
     const allowedTools: string[] = [];
 
@@ -85,7 +92,7 @@ export class AgentPrepHandler {
     this.toolRegistry.setActive(allowedTools);
 
     const toolPromptResult = sanitizeAvailableToolsSection(
-      event.systemPrompt,
+      systemPrompt,
       allowedTools,
     );
     const skillPromptResult = resolveSkillPromptEntries(
@@ -95,7 +102,7 @@ export class AgentPrepHandler {
       this.session.getPathNormalizer(),
     );
     this.session.setActiveSkillEntries(skillPromptResult.entries);
-    return skillPromptResult.prompt !== event.systemPrompt
+    return skillPromptResult.prompt !== systemPrompt
       ? { systemPrompt: skillPromptResult.prompt }
       : {};
   }
