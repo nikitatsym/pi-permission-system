@@ -11,6 +11,20 @@ Permission enforcement extension for the [Pi](https://pi.mariozechner.at/) codin
 > **Fork notice:** This package is a full fork of [MasuRii/pi-permission-system](https://github.com/MasuRii/pi-permission-system), published to npm as `@gotgenes/pi-permission-system`.
 > It has diverged substantially from upstream in config format, internal architecture, and permission model.
 
+> **omp fork:** Fork of `@gotgenes/pi-permission-system` 20.10.0
+> (from [gotgenes/pi-packages](https://github.com/gotgenes/pi-packages)) for
+> [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp), with patches:
+>
+> 1. `before_agent_start` accepts omp's array-form `systemPrompt`.
+> 2. Permission previews for `write` to `xd://` tool devices show the written
+>    content, which is the device command.
+> 3. `registry.getProvider`, which @mzwing/pi-permission-auto-review needs and
+>    omp's ModelRegistry lacks, is added at session start.
+>
+> The package name is unchanged so authorizer links resolve their peer dependency.
+>
+> Install on omp: `omp plugin install "git+https://github.com/nikitatsym/pi-permission-system.git"`
+
 ## What It Does
 
 - **Hides disallowed tools** before the agent starts — no wasted turns probing for blocked tools
