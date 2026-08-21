@@ -31,6 +31,7 @@ import { GateRunner } from "./handlers/gates/runner";
 import { SkillInputGatePipeline } from "./handlers/gates/skill-input-gate-pipeline";
 import { ToolCallGatePipeline } from "./handlers/gates/tool-call-gate-pipeline";
 import { createFailClosedToolCall } from "./handlers/tool-call-boundary";
+import { patchOmpModelRegistry } from "./omp-model-registry-shim";
 import { pathFlavorForPlatform } from "./path/path-flavor";
 import { PermissionManager } from "./permission-manager";
 import { PermissionResolver } from "./permission-resolver";
@@ -255,14 +256,18 @@ export default function piPermissionSystemExtension(pi: ExtensionAPI): void {
     gateRunner,
   );
 
-  pi.on("session_start", (event, ctx) =>
-    lifecycle.handleSessionStart(event, ctx),
-  );
+  pi.on("session_start", (event, ctx) => {
+    patchOmpModelRegistry(ctx);
+    return lifecycle.handleSessionStart(event, ctx);
+  });
   pi.on("resources_discover", (event) =>
     lifecycle.handleResourcesDiscover(event),
   );
   pi.on("session_shutdown", () => lifecycle.handleSessionShutdown());
-  pi.on("before_agent_start", (event, ctx) => agentPrep.handle(event, ctx));
+  pi.on("before_agent_start", (event, ctx) => {
+    patchOmpModelRegistry(ctx);
+    return agentPrep.handle(event, ctx);
+  });
   pi.on("input", (event, ctx) => gates.handleInput(event, ctx));
   pi.on(
     "tool_call",
