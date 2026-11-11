@@ -5,9 +5,21 @@
   "permissionReviewLog": true,
   "yoloMode": false,
   "doublePressToConfirm": true,
+  "permissionDialogKeys": {
+    "approve": "y",
+    "approveSession": "s",
+    "approveSessionBoth": "b",
+    "deny": "n",
+    "denyWithReason": "r"
+  },
+  "promptNotifications": [],
 
-  "toolInputPreviewMaxLength": 400,
-  "toolTextSummaryMaxLength": 120,
+  "forwardingTimeoutMs": 600000,
+
+  "promptMaxRows": 24,
+  "promptFieldMaxWidth": 400,
+
+  "reviewLogFieldMaxWidth": 1000,
 
   "piInfrastructureReadPaths": [],
 
@@ -15,6 +27,13 @@
 
   "shellTools": {
     "exec_command": { "commandArgument": "cmd", "workdirArgument": "workdir" }
+  },
+
+  "commandEffects": {
+    "git": {
+      "unlessOption": ["--output"],
+      "subcommands": { "log": "read", "status": "read", "diff": "read" }
+    }
   },
 
   "permission": {
@@ -41,6 +60,8 @@
       "*": "ask",
       "~/development/*": "allow",
       "~/.cargo/registry/*": "allow"
-    }
+    },
+    "external_directory_read": { "~/dev/*": "allow" },
+    "path_write": { "~/.ssh/*": "deny" }
   }
 }

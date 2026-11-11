@@ -1,7 +1,10 @@
+import { canonicalizePath } from "#src/path/canonicalize-path";
+import type { NativeToolTarget } from "#src/path/native-tool-target";
 import type { PathFlavor } from "#src/path/path-flavor";
 
 import {
   canonicalNormalizePathForComparison,
+  cwdRelativePolicyValues,
   getPathPolicyValues,
   normalizePathForComparison,
 } from "./path-normalization";
@@ -25,7 +28,8 @@ import {
  *   only when it names a location distinct from the lexical form, for
  *   disclosing a symlink target in a prompt or denial message.
  *
- * Construct via {@link forPath} (resolved, with optional cd-folded base) or
+ * Construct via {@link forPath} (resolved, with optional cd-folded base),
+ * {@link forNativeTarget} (the file a built-in Pi tool opens), or
  * {@link forLiteral} (literal-only, for an unknown base); the constructor is
  * private.
  */
@@ -34,6 +38,7 @@ export class AccessPath {
     private readonly lexical: string,
     private readonly matchAliases: readonly string[],
     private readonly canonical: string,
+    private readonly rewritten = false,
   ) {}
 
   /**
@@ -72,16 +77,17 @@ export class AccessPath {
   }
 
   /**
-   * The canonical (symlink-resolved) form when it names a location distinct
-   * from the lexical form — for disclosing the resolved target in a prompt or
-   * denial message. `undefined` when the path is not a symlink (canonical
-   * equals lexical) or has no canonical (literal-only / empty input).
+   * The location the access reaches when it differs from what was typed — for
+   * disclosing it in a prompt or denial message: the canonical
+   * (symlink-resolved) form when it is distinct from the lexical form, else the
+   * lexical form itself when a built-in tool's resolver rewrote the typed
+   * spelling ({@link forNativeTarget}). `undefined` otherwise.
    */
   resolvedAlias(): string | undefined {
-    if (!this.canonical || this.canonical === this.lexical) {
-      return undefined;
+    if (this.canonical && this.canonical !== this.lexical) {
+      return this.canonical;
     }
-    return this.canonical;
+    return this.rewritten ? this.lexical : undefined;
   }
 
   /**
@@ -116,24 +122,48 @@ export class AccessPath {
   }
 
   /**
+   * Build an `AccessPath` for the file a built-in Pi file tool opens, from its
+   * already-resolved {@link NativeToolTarget}.
+   *
+   * The target is taken as the tool will open it: no literal cleanup (trim,
+   * quote strip, `$HOME`), since Pi's resolver applies none. `matchValues()`
+   * is the target, its cwd-relative alias, and the tool's relative spelling,
+   * plus the canonical form — the same array {@link forPath} builds for a
+   * relative or already-normalized spelling the tool does not rewrite. An
+   * absolute spelling with `..` or doubled separators keeps no as-typed alias:
+   * `/tmp/../etc/passwd` matches as `/etc/passwd`, the file opened, so a rule
+   * on `/tmp/*` no longer covers it.
+   */
+  static forNativeTarget(
+    native: NativeToolTarget,
+    options: { cwd: string; flavor: PathFlavor },
+  ): AccessPath {
+    const { cwd, flavor } = options;
+    const lexical = flavor.comparable(native.target, cwd);
+    const aliases = [
+      lexical,
+      ...cwdRelativePolicyValues(lexical, cwd, flavor),
+      ...(native.relativeSpelling ? [native.relativeSpelling] : []),
+    ];
+    return new AccessPath(
+      lexical,
+      [...new Set(aliases)],
+      flavor.fold(canonicalizePath(lexical, flavor)),
+      native.rewritten,
+    );
+  }
+
+  /**
    * Build a literal-only `AccessPath` for a path whose effective base is
    * unknown (a relative bash token after a non-literal `cd`).
    *
    * Carries no canonical alias and no absolute resolution — `matchValues()` is
-   * `[literal, ...matchAliases]` (or `[]` when empty) and `boundaryValue()` is
-   * `""` — so no spurious absolute or symlink-resolved rule can match (#393).
-   *
-   * `matchAliases` supplies extra match-only forms that do not change the
-   * display value: a win32 Git Bash POSIX absolute carries a backslash-separated
-   * alias so the separator-folding path matcher can match a `/tmp/*` rule (#533).
+   * `[literal]` (or `[]` when empty) and `boundaryValue()` is `""` — so no
+   * spurious absolute or symlink-resolved rule can match (#393).
    */
-  static forLiteral(
-    literal: string,
-    matchAliases: readonly string[] = [],
-  ): AccessPath {
+  static forLiteral(literal: string): AccessPath {
     if (!literal) return new AccessPath("", [], "");
-    const aliases = [...new Set([literal, ...matchAliases.filter(Boolean)])];
-    return new AccessPath(literal, aliases, "");
+    return new AccessPath(literal, [literal], "");
   }
 
   /**

@@ -3,8 +3,8 @@ import type {
   FlatPermissionConfig,
   PatternValue,
   PermissionState,
-} from "./config-schema";
-import type { RuleOrigin } from "./rule";
+} from "#src/config/config-schema";
+import type { RuleOrigin } from "#src/policy/rule";
 
 // The config-file shape types are derived from the zod schema
 // (config-schema.ts) — the single source of truth — and re-exported here so
@@ -18,22 +18,18 @@ export type {
 };
 
 /**
- * Predicate deciding whether a bare bash token should be promoted into the
- * `path` rule-candidate surface.
- *
- * Built by `PermissionManager.getPromotablePathTokenMatcher` from the
- * composed config ruleset (specific, non-`*` `path` deny/ask patterns) and
- * threaded through to `BashPathResolver` so promotion policy stays in the
- * manager while the bash layer only asks the predicate.
- */
-export type PathRuleTokenMatcher = (token: string) => boolean;
-
-/**
  * Per-scope permission config shape after loading and validation.
  * Holds only the flat permission map — all policy is expressed there.
  */
 export interface ScopeConfig {
   permission?: FlatPermissionConfig;
+  /**
+   * True when the scope's config file was present but failed to load or
+   * validate (JSON parse error or schema rejection). Absent and valid files
+   * leave this unset. Drives the fail-closed allow→ask clamp for non-global
+   * scopes (#646).
+   */
+  invalid?: boolean;
 }
 
 /**
@@ -44,6 +40,31 @@ export type BashCommandContext =
   | "command_substitution"
   | "process_substitution"
   | "subshell";
+
+/**
+ * Why an indirection wrapper's floor did not apply after all (#803).
+ *
+ * `"core-reader"` — the command the wrapper runs is in the built-in pure-reader
+ * core, so it is read-only for any argument feed and the floor's reason (an
+ * unknown direction behind the wrapper) does not hold.
+ *
+ * `"execution-modifier"` — every wrapper layer (`time`, `timeout`, `nice`,
+ * `stdbuf`, `setsid`) changes only how the visible inner command runs, so the
+ * unit is decided by that command's own rule whatever it does (#963).
+ *
+ * `"no-command"` — the wrapper names no command at all, and its bare form runs
+ * nothing (`env` alone prints the environment), so there is nothing for it to
+ * hide and the unit is decided by its own rule, as `printenv` is.
+ *
+ * A named reason rather than a boolean, so the review log states *why* a
+ * wrapper was let through, and so a later source (a chain verdict, a user
+ * declaration) is an added member rather than a second flag. ADR 0013 §11
+ * keeps both reasons package-audited; user declarations do not lift the floor.
+ */
+export type FloorExemption =
+  | "core-reader"
+  | "execution-modifier"
+  | "no-command";
 
 export interface PermissionCheckResult {
   toolName: string;
@@ -62,6 +83,49 @@ export interface PermissionCheckResult {
    * (top-level) commands.
    */
   commandContext?: BashCommandContext;
+  /**
+   * The command the winning bash unit actually runs, when it is a wrapper whose
+   * inner command differs from the unit text (#713). Display-only: the gate
+   * decides on `command`, and on `executedUnit`'s rules only when
+   * {@link floorExemption} says the wrapper's floor has no reason to hold.
+   */
+  executedUnit?: string;
+  /**
+   * The spelling of the bash unit the winning rule matched, when the rule did
+   * not also match the unit as typed — the absolute spelling of a relative
+   * path argument, say (#910). Display-only: absent whenever the typed text
+   * decided, and dropped by a floor that replaces {@link matchedPattern}.
+   */
+  matchedSpelling?: string;
+  /**
+   * Set when the winning bash unit is a wrapper the floor no longer covers,
+   * naming why (#803, #963). Recorded in the review log so an allow the floor would
+   * once have prompted for is auditable to the reason that let it through.
+   */
+  floorExemption?: FloorExemption;
+  /**
+   * The synthetic pattern of a floor that raised this ask on the bash chain —
+   * on the deciding unit, or on another asking unit of the same command. Only
+   * the child's parse knows it, so a forwarded ask carries it for the serving
+   * node to clamp its own `allow` with.
+   */
+  floor?: string;
+  /**
+   * Every unit of the bash chain that resolved to `ask` and was not
+   * session-granted, in chain order, each with its own floor. Set only on an
+   * asking chain winner: the serving node of a forwarded ask judges each one,
+   * since the winner alone would approve commands it never saw.
+   */
+  askingUnits?: readonly AskingBashUnit[];
+}
+
+/**
+ * One unit of a bash chain the gate left asking, as the serving node of a
+ * forwarded ask needs it: the unit as typed, and the floor that raised it.
+ */
+export interface AskingBashUnit {
+  command: string;
+  floor?: string;
 }
 
 export function isPermissionState(value: unknown): value is PermissionState {

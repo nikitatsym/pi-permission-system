@@ -8,8 +8,20 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-
-import { isPermissionDecisionState } from "#src/authority/permission-dialog";
+import {
+  OWNER_ONLY_DIRECTORY_MODE,
+  OWNER_ONLY_FILE_MODE,
+} from "#src/logging/log-file-permissions";
+import type { DebugReviewLogger } from "#src/logging/session-logger";
+import { asPromptPayload } from "#src/presentation/prompt-payload";
+import type { PermissionUiPromptSource } from "#src/service/permission-events";
+import {
+  type ApprovalGrant,
+  isSessionGrantWidth,
+} from "#src/session/approval-grant";
+import type { AskingBashUnit } from "#src/types";
+import { asDecisionSource } from "./decision-source";
+import { isPermissionDecisionState } from "./permission-dialog";
 import {
   createPermissionForwardingLocation,
   type ForwardedAccessIntent,
@@ -17,9 +29,11 @@ import {
   type ForwardedPermissionResponse,
   type ForwardedSessionApproval,
   type PermissionForwardingLocation,
-} from "#src/authority/permission-forwarding";
-import type { PermissionUiPromptSource } from "#src/permission-events";
-import type { DebugReviewLogger } from "#src/session-logger";
+} from "./permission-forwarding";
+import {
+  retryOnTransientFsError,
+  type TransientFsRetryRecord,
+} from "./transient-fs-retry";
 
 /** Valid `permissions:ui_prompt` source values, for tolerant request reads. */
 const UI_PROMPT_SOURCES = [
@@ -43,12 +57,34 @@ function asNullableDisplayString(value: unknown): string | null | undefined {
   return undefined;
 }
 
+/** Narrow an unknown value to an `ApprovalGrant`, or `undefined`. */
+function asApprovalGrant(value: unknown): ApprovalGrant | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const candidate = value as Partial<ApprovalGrant>;
+  if (
+    typeof candidate.surface !== "string" ||
+    candidate.surface.length === 0 ||
+    typeof candidate.pattern !== "string"
+  ) {
+    return undefined;
+  }
+  return { surface: candidate.surface, pattern: candidate.pattern };
+}
+
 /**
  * Narrow an unknown value to a `ForwardedSessionApproval`, or `undefined`.
  *
  * Tolerant read: the child's session-approval suggestion is optional (absent
- * on an older child) and only accepted when well-formed — a non-empty surface
- * and an all-string patterns array.
+ * on an older child) and only accepted when well-formed — a non-empty `grants`
+ * array whose every entry names a non-empty surface and a pattern. The
+ * pre-#810 shape (`surface` plus `patterns`) is rejected rather than
+ * normalized, so a version-skewed request drops the suggestion and the serving
+ * dialog offers no whole-session scope.
+ *
+ * An empty `grants` array is rejected too: it would record nothing while still
+ * writing a `forwarded_permission.session_recorded` entry claiming it had.
  */
 function asForwardedSessionApproval(
   value: unknown,
@@ -57,15 +93,16 @@ function asForwardedSessionApproval(
     return undefined;
   }
   const candidate = value as Partial<ForwardedSessionApproval>;
-  if (
-    typeof candidate.surface !== "string" ||
-    candidate.surface.length === 0 ||
-    !Array.isArray(candidate.patterns) ||
-    !candidate.patterns.every((pattern) => typeof pattern === "string")
-  ) {
+  if (!Array.isArray(candidate.grants) || candidate.grants.length === 0) {
     return undefined;
   }
-  return { surface: candidate.surface, patterns: [...candidate.patterns] };
+  const grants: ApprovalGrant[] = [];
+  for (const entry of candidate.grants) {
+    const grant = asApprovalGrant(entry);
+    if (!grant) return undefined;
+    grants.push(grant);
+  }
+  return { grants };
 }
 
 /**
@@ -88,6 +125,9 @@ function asForwardedAccessIntent(
     surface?: unknown;
     matchValues?: unknown;
     boundaryValue?: unknown;
+    floor?: unknown;
+    askingUnits?: unknown;
+    delegationLicense?: unknown;
     requesterCwd?: unknown;
     principal?: unknown;
   };
@@ -98,6 +138,15 @@ function asForwardedAccessIntent(
     !(
       candidate.boundaryValue === null ||
       typeof candidate.boundaryValue === "string"
+    ) ||
+    // A malformed floor drops the whole intent, which escalates: it must
+    // never read as "no floor".
+    !(candidate.floor === undefined || typeof candidate.floor === "string") ||
+    // Likewise a malformed unit list: it must never read as "no units", which
+    // would judge the chain's winner alone.
+    !(
+      candidate.askingUnits === undefined ||
+      isWellFormedAskingUnits(candidate.askingUnits)
     ) ||
     typeof candidate.requesterCwd !== "string" ||
     typeof candidate.principal !== "object" ||
@@ -119,12 +168,54 @@ function asForwardedAccessIntent(
     surface: candidate.surface,
     matchValues: [...candidate.matchValues],
     boundaryValue: candidate.boundaryValue,
+    ...(candidate.floor === undefined ? {} : { floor: candidate.floor }),
+    ...(isWellFormedAskingUnits(candidate.askingUnits)
+      ? { askingUnits: copyAskingUnits(candidate.askingUnits) }
+      : {}),
+    // Unlike a malformed floor, an unrecognized license drops only itself:
+    // absence is the restrictive reading, so the intent stays usable.
+    ...(candidate.delegationLicense === "nothing-on-disk"
+      ? { delegationLicense: candidate.delegationLicense }
+      : {}),
     requesterCwd: candidate.requesterCwd,
     principal: {
       sessionId: principal.sessionId,
       agentName: principal.agentName,
     },
   };
+}
+
+/**
+ * True for a non-empty list of `{ command: string, floor?: string }` units.
+ *
+ * Empty is malformed: a child stamps the list only when it holds a unit, so an
+ * empty one says nothing a well-formed request would.
+ */
+function isWellFormedAskingUnits(
+  value: unknown,
+): value is readonly { command: string; floor?: string }[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (unit: unknown) =>
+        typeof unit === "object" &&
+        unit !== null &&
+        typeof (unit as { command?: unknown }).command === "string" &&
+        ((unit as { floor?: unknown }).floor === undefined ||
+          typeof (unit as { floor?: unknown }).floor === "string"),
+    )
+  );
+}
+
+/** Rebuild each unit field by field, so no unread key rides through. */
+function copyAskingUnits(
+  units: readonly { command: string; floor?: string }[],
+): AskingBashUnit[] {
+  return units.map((unit) => ({
+    command: unit.command,
+    ...(unit.floor === undefined ? {} : { floor: unit.floor }),
+  }));
 }
 
 export function formatUnknownErrorMessage(error: unknown): string {
@@ -185,7 +276,14 @@ export function ensureDirectoryExists(
   description: string,
 ): boolean {
   try {
-    mkdirSync(path, { recursive: true });
+    recordFsRetry(
+      logger,
+      "mkdir",
+      path,
+      retryOnTransientFsError(() => {
+        mkdirSync(path, { recursive: true, mode: OWNER_ONLY_DIRECTORY_MODE });
+      }),
+    );
     return true;
   } catch (error) {
     logPermissionForwardingError(
@@ -365,12 +463,51 @@ export function writeJsonFileAtomic(
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
 
   try {
-    writeFileSync(tempPath, JSON.stringify(value), "utf-8");
-    renameSync(tempPath, filePath);
+    // `rename` preserves the temp file's mode, so setting it here is enough —
+    // a response overwriting an existing file also comes through a fresh temp.
+    // The temp write is deliberately outside the retry: its failure shape is a
+    // write-denied directory, which no number of attempts resolves.
+    writeFileSync(tempPath, JSON.stringify(value), {
+      encoding: "utf-8",
+      mode: OWNER_ONLY_FILE_MODE,
+    });
+    recordFsRetry(
+      logger,
+      "rename",
+      filePath,
+      retryOnTransientFsError(() => {
+        renameSync(tempPath, filePath);
+      }),
+    );
   } catch (error) {
     safeDeleteFile(logger, tempPath, "temporary permission-forwarding");
     throw error;
   }
+}
+
+/**
+ * Record a filesystem operation that only succeeded after retrying.
+ *
+ * Debug-only: a recovered write decided nothing, so it does not belong in the
+ * permission-decision record — but `attempts` and `code` are the whole
+ * diagnosis when a host keeps losing writes, and `debugLog` is exactly the
+ * switch a user reaching for that diagnosis turns on.
+ */
+function recordFsRetry(
+  logger: DebugReviewLogger | null,
+  operation: "rename" | "mkdir",
+  path: string,
+  record: TransientFsRetryRecord,
+): void {
+  if (record.attempts === 1) {
+    return;
+  }
+  logger?.debug("permission_forwarding.fs_retried", {
+    operation,
+    path,
+    attempts: record.attempts,
+    code: record.code,
+  });
 }
 
 export function readForwardedPermissionRequest(
@@ -387,8 +524,7 @@ export function readForwardedPermissionRequest(
       typeof parsed.createdAt !== "number" ||
       typeof parsed.requesterSessionId !== "string" ||
       typeof parsed.targetSessionId !== "string" ||
-      typeof parsed.requesterAgentName !== "string" ||
-      typeof parsed.message !== "string"
+      typeof parsed.requesterAgentName !== "string"
     ) {
       logPermissionForwardingWarning(
         logger,
@@ -403,9 +539,11 @@ export function readForwardedPermissionRequest(
       requesterSessionId: parsed.requesterSessionId,
       targetSessionId: parsed.targetSessionId,
       requesterAgentName: parsed.requesterAgentName,
-      message: parsed.message,
-      // Tolerant read: display fields are optional and may be absent (older
-      // child) or malformed; reconstruct only the well-formed ones.
+      // Tolerant read: the payload and display fields are optional and may be
+      // absent (older child) or malformed; reconstruct only the well-formed
+      // ones. An older child's `message` is deliberately not salvaged — a
+      // skewed ask renders from the fields it does carry (ADR 0011 §9).
+      payload: asPromptPayload(parsed.payload),
       source: asUiPromptSource(parsed.source),
       surface: asNullableDisplayString(parsed.surface),
       value: asNullableDisplayString(parsed.value),
@@ -455,6 +593,15 @@ export function readForwardedPermissionResponse(
         typeof parsed.respondedAt === "number"
           ? parsed.respondedAt
           : Date.now(),
+      // Tolerant like the request's `accessIntent`: an unusable provenance
+      // record is dropped, but the decision itself still has to reach the
+      // requester, so it never rejects the response.
+      decidedBy: asDecisionSource(parsed.decidedBy),
+      // Tolerant for the same reason, and least-privilege when it fires: a
+      // dropped width records the grant on the surface the gate proved.
+      sessionGrantWidth: isSessionGrantWidth(parsed.sessionGrantWidth)
+        ? parsed.sessionGrantWidth
+        : undefined,
     };
   } catch (error) {
     logPermissionForwardingWarning(

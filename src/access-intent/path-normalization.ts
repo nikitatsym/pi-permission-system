@@ -1,5 +1,5 @@
-import { expandHomePath } from "#src/expand-home";
 import { canonicalizePath } from "#src/path/canonicalize-path";
+import { expandHomePath } from "#src/path/expand-home";
 import type { PathFlavor } from "#src/path/path-flavor";
 
 /**
@@ -83,17 +83,22 @@ function getAbsolutePathPolicyValues(
 
   return [
     absolute,
-    ...getCwdRelativePathPolicyValues(absolute, options.cwd, flavor),
+    ...(options.cwd
+      ? cwdRelativePolicyValues(absolute, options.cwd, flavor)
+      : []),
   ];
 }
 
-function getCwdRelativePathPolicyValues(
+/**
+ * The project-relative alias of an already-absolute comparison value: `[rel]`
+ * when `absolute` lies strictly inside `cwd`, otherwise `[]`. Lets a relative
+ * rule (`src/*`) match a path however it was spelled.
+ */
+export function cwdRelativePolicyValues(
   absolute: string,
-  cwd: string | undefined,
+  cwd: string,
   flavor: PathFlavor,
 ): string[] {
-  if (!cwd) return [];
-
   const normalizedCwd = normalizePathForComparison(cwd, cwd, flavor);
   if (!normalizedCwd) return [];
   if (absolute !== normalizedCwd && !flavor.isWithin(absolute, normalizedCwd)) {

@@ -1,11 +1,12 @@
 import type { PlatformPath } from "node:path";
 import { posix as posixPath, win32 as winPath } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   type BashTokenShape,
   classifyWin32BashToken,
 } from "#src/access-intent/bash/msys-bash-tokens";
-import type { WildcardMatchOptions } from "#src/wildcard-matcher";
+import type { WildcardMatchOptions } from "#src/policy/wildcard-matcher";
 
 /**
  * The resolved product of the single win32-vs-POSIX platform decision: the
@@ -17,7 +18,8 @@ import type { WildcardMatchOptions } from "#src/wildcard-matcher";
  * fold or separator fold is a silent bypass (the #382 / #508 class). `PathFlavor`
  * captures that mapping once so the leaves consume the resolved capability
  * instead of re-interpreting a raw `NodeJS.Platform` string. It owns platform
- * **semantics** — syntax ({@link hasPathSeparator}), token shape
+ * **semantics** — syntax ({@link hasPathSeparator} /
+ * {@link lastSeparatorIndex}), token shape
  * ({@link bashTokenShape}), and the equivalence relation ({@link fold} /
  * {@link comparable} / {@link isWithin} / {@link matchOptions}); domain policy
  * (lexical cleanup, alias generation, safe-system-path exclusions, rule
@@ -51,15 +53,40 @@ export interface PathFlavor {
    */
   hasPathSeparator(token: string): boolean;
   /**
+   * Index of the last path separator in `value`, or `-1` when it holds none.
+   *
+   * Reads the same separator alphabet as {@link hasPathSeparator}, so a caller
+   * that must split a path at its directory boundary uses the separator the
+   * value was written with rather than this platform's default `sep` — the two
+   * differ for a Git Bash token on a win32 host (`/dev/null`, `/tmp/logs/`).
+   */
+  lastSeparatorIndex(value: string): number;
+  /**
    * The MSYS/Git-Bash interpretation of a bash-command token. On win32 this
    * carries device / drive-mount / posix-absolute / plain semantics; on POSIX
    * every token is an ordinary path, so the shape is always `{ kind: "plain" }`.
    */
   bashTokenShape(token: string): BashTokenShape;
+  /**
+   * The drive translation Pi's built-in file tools apply to their `path`
+   * argument: on win32, a Git Bash / MSYS / Cygwin / WSL drive path (`/c/x`,
+   * `/mnt/c/x`, `/cygdrive/c/x`) becomes `C:\x`; on POSIX the value is
+   * unchanged. Mirrors Pi's `normalizeWindowsShellPath`, which recognizes more
+   * mount spellings than a bash token's {@link bashTokenShape}.
+   */
+  toolShellPath(value: string): string;
+  /**
+   * Decode a `file://` URL into this platform's path, as Pi's built-in file
+   * tools do. Throws like Node's `fileURLToPath` for a URL the platform
+   * cannot express (a POSIX URL naming a host).
+   */
+  fileUrlToPath(url: string): string;
 }
 
 class PlatformPathFlavor implements PathFlavor {
   readonly matchOptions: WildcardMatchOptions | undefined;
+  /** Every separator spelling this platform recognizes, the one alphabet both separator answers read. */
+  private readonly separators: readonly string[];
 
   constructor(
     readonly impl: PlatformPath,
@@ -68,10 +95,19 @@ class PlatformPathFlavor implements PathFlavor {
     this.matchOptions = windows
       ? { caseInsensitive: true, windowsSeparators: true }
       : undefined;
+    this.separators = windows ? ["/", "\\"] : ["/"];
   }
 
   fold(value: string): string {
     return this.windows ? value.toLowerCase() : value;
+  }
+
+  toolShellPath(value: string): string {
+    return this.windows ? toWindowsDrivePath(value) : value;
+  }
+
+  fileUrlToPath(url: string): string {
+    return fileURLToPath(url, { windows: this.windows });
   }
 
   comparable(pathValue: string, base: string): string {
@@ -91,7 +127,14 @@ class PlatformPathFlavor implements PathFlavor {
   }
 
   hasPathSeparator(token: string): boolean {
-    return token.includes("/") || (this.windows && token.includes("\\"));
+    return this.lastSeparatorIndex(token) >= 0;
+  }
+
+  lastSeparatorIndex(value: string): number {
+    return this.separators.reduce(
+      (last, separator) => Math.max(last, value.lastIndexOf(separator)),
+      -1,
+    );
   }
 
   bashTokenShape(token: string): BashTokenShape {
@@ -111,4 +154,27 @@ export const win32PathFlavor: PathFlavor = new PlatformPathFlavor(
 /** The one win32-vs-POSIX platform decision in the package. */
 export function pathFlavorForPlatform(platform: NodeJS.Platform): PathFlavor {
   return platform === "win32" ? win32PathFlavor : posixPathFlavor;
+}
+
+/** A drive path as Pi's file tools spell it: optional WSL/Cygwin mount, a letter, an optional tail. */
+const TOOL_DRIVE_PATH_PATTERN = /^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i;
+
+/**
+ * Pi's `normalizeWindowsShellPath`: a UNC (`//…`) or backslashed value is
+ * already native and passes through, as does anything not shaped like a drive.
+ */
+function toWindowsDrivePath(value: string): string {
+  if (
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\")
+  ) {
+    return value;
+  }
+  const match = TOOL_DRIVE_PATH_PATTERN.exec(value);
+  if (!match) return value;
+  const [, letter] = match;
+  // The tail group is optional, so it is absent for a bare drive (`/c`).
+  const tail = match.at(2) ?? "";
+  return `${letter.toUpperCase()}:\\${tail.replaceAll("/", "\\")}`;
 }

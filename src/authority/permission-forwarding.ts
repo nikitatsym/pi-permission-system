@@ -1,11 +1,39 @@
 import { join } from "node:path";
-import type { PermissionUiPromptSource } from "#src/permission-events";
+import type { PromptPayload } from "#src/presentation/prompt-payload";
+import type { PermissionUiPromptSource } from "#src/service/permission-events";
+import type {
+  ApprovalGrant,
+  SessionGrantWidth,
+} from "#src/session/approval-grant";
+import type { AskingBashUnit } from "#src/types";
+import type { DecisionSource } from "./decision-source";
 import type { PermissionDecisionState } from "./permission-dialog";
 import type { SubagentSessionRegistry } from "./subagent-registry";
 
 export const PERMISSION_FORWARDING_POLL_INTERVAL_MS = 250;
 export const PERMISSION_FORWARDING_TIMEOUT_MS = 10 * 60 * 1000;
-export const SUBAGENT_ENV_HINT_KEYS = [
+/**
+ * How long an in-process forwarding target may go unserved before the child
+ * gives up on it — eight poll ticks.
+ *
+ * A window rather than a single check because `ForwardingManager` withdraws and
+ * re-announces across a session switch, and a request that arrives inside that
+ * gap is about to be picked up. Not configurable: the operator-facing knob is
+ * the overall timeout, and this only decides how fast a hopeless wait ends.
+ */
+export const PERMISSION_FORWARDING_SERVING_GRACE_MS =
+  8 * PERMISSION_FORWARDING_POLL_INTERVAL_MS;
+/** Ordered list of env var names to check for the parent session ID. First match wins. */
+export const SUBAGENT_PARENT_SESSION_ENV_CANDIDATES: readonly string[] = [
+  // pi-agent-router (original)
+  "PI_AGENT_ROUTER_PARENT_SESSION_ID",
+  // Shared convention for CLI-based subagent extensions
+  // (nicobailon/pi-subagents, HazAT/pi-interactive-subagents, etc.)
+  "PI_SUBAGENT_PARENT_SESSION",
+] as const;
+
+/** Per-extension markers set by known process-based subagent extensions. */
+const THIRD_PARTY_SUBAGENT_ENV_HINTS = [
   // pi-agent-router (original)
   "PI_IS_SUBAGENT",
   "PI_SUBAGENT_SESSION_ID",
@@ -21,14 +49,20 @@ export const SUBAGENT_ENV_HINT_KEYS = [
   "PI_SUBAGENT_SESSION",
   "PI_SUBAGENT_ACTIVITY_FILE",
 ] as const;
-/** Ordered list of env var names to check for the parent session ID. First match wins. */
-export const SUBAGENT_PARENT_SESSION_ENV_CANDIDATES: readonly string[] = [
-  // pi-agent-router (original)
-  "PI_AGENT_ROUTER_PARENT_SESSION_ID",
-  // Shared convention for CLI-based subagent extensions
-  // (nicobailon/pi-subagents, HazAT/pi-interactive-subagents, etc.)
-  "PI_SUBAGENT_PARENT_SESSION",
-] as const;
+
+/**
+ * Env vars whose presence marks the current process as a subagent child.
+ *
+ * A process that names a parent session is a child by definition, so every
+ * parent-session candidate is a detection hint too. That is what makes the
+ * subagent adapter convention's single out-of-process obligation — set
+ * `PI_SUBAGENT_PARENT_SESSION` — sufficient on its own: an implementation owes
+ * the announcement and nothing else, and detection is this package's job.
+ */
+export const SUBAGENT_ENV_HINT_KEYS: readonly string[] = [
+  ...THIRD_PARTY_SUBAGENT_ENV_HINTS,
+  ...SUBAGENT_PARENT_SESSION_ENV_CANDIDATES,
+];
 
 /** @deprecated Use SUBAGENT_PARENT_SESSION_ENV_CANDIDATES */
 export const SUBAGENT_PARENT_SESSION_ENV_KEY =
@@ -42,9 +76,9 @@ const SESSION_FORWARDING_RESPONSES_DIRECTORY_NAME = "responses";
  * Display fields relayed from a forwarding child to the parent UI so the parent
  * can emit a non-degraded `permissions:ui_prompt` event.
  *
- * Carried separately from the prompt message because the parent reconstructs
+ * Carried separately from the prompt payload because the parent reconstructs
  * the original event from the escalated ask's details (`buildUiPrompt`), not
- * from the message text.
+ * from the payload's own facts.
  */
 export interface ForwardedPromptDisplay {
   source: PermissionUiPromptSource;
@@ -54,16 +88,21 @@ export interface ForwardedPromptDisplay {
 
 /**
  * The child's session-approval suggestion, relayed to the serving node so a
- * human who grants "the whole session" records the same pattern the child
- * would have recorded locally.
+ * human who grants "the whole session" records the same grants the child would
+ * have recorded locally.
  *
  * A plain data shape (not the `SessionApproval` value object) so it serializes
  * onto the forwarded request; the serving node rebuilds a `SessionApproval`
- * from it via `SessionApproval.multiple`.
+ * from it via `SessionApproval.forGrants`.
+ *
+ * Each grant carries its own surface (#810). The pre-#810 shape — one
+ * `surface` plus a `patterns` list — is rejected by the reader rather than
+ * normalized, so a version-skewed pair drops the suggestion and the serving
+ * dialog offers no whole-session scope; the requesting child still records its
+ * own grant, so the failure is narrow in both directions.
  */
 export interface ForwardedSessionApproval {
-  surface: string;
-  patterns: readonly string[];
+  grants: readonly ApprovalGrant[];
 }
 
 /**
@@ -85,6 +124,30 @@ export interface ForwardedAccessFacts {
   matchValues: string[];
   /** `AccessPath.boundaryValue()` (canonical) for a path surface; `null` for a non-path surface. */
   boundaryValue: string | null;
+  /**
+   * The synthetic pattern of a floor that raised a bash ask on the child
+   * (`<indirection-bash-wrapper>`, `<opaque-bash-wrapper>`,
+   * `<unparsed-bash-subtree>`, `<unparseable-bash-command>`). Only the child's
+   * parse knows it, so the serving node clamps its own `allow` with it rather
+   * than recomputing it. Absent when no floor was raised.
+   */
+  floor?: string;
+  /**
+   * Every unit of a bash chain the child left asking, each with its own floor.
+   * `matchValues` names only the chain's winner, and the serving node's answer
+   * approves the whole tool call, so it judges each of these instead. Absent
+   * for a non-bash ask and for a bash ask raised without a chain (the empty
+   * parse), where `matchValues` is the whole command.
+   */
+  askingUnits?: AskingBashUnit[];
+  /**
+   * Set only by the bash external-directory gate, when every path it left
+   * uncovered names nothing on disk below the filesystem root, was located
+   * against a known working directory, and is not a proven write (ADR 0007 §8). The
+   * delegation envelope honors a link's `allow` on the `external_directory`
+   * family only when it is present; absence means unlicensed.
+   */
+  delegationLicense?: "nothing-on-disk";
 }
 
 /**
@@ -112,7 +175,15 @@ export type ForwardedPermissionRequest = {
   requesterSessionId: string;
   targetSessionId: string;
   requesterAgentName: string;
-  message: string;
+  /**
+   * The child's complete prompt payload (ADR 0011 §2), so the serving node
+   * renders the child's own facts under the *parent's* budget rather than
+   * relaying a sentence the child assembled under its own configuration.
+   *
+   * Optional for version-skew tolerance: an older child omits it, and the
+   * serving node renders from the display fields it does carry (ADR 0011 §9).
+   */
+  payload?: PromptPayload;
   /**
    * Original prompt display fields, persisted so the parent emits a
    * non-degraded event. Optional for version-skew tolerance: a parent on a
@@ -143,6 +214,28 @@ export type ForwardedPermissionResponse = {
   denialReason?: string;
   responderSessionId: string;
   respondedAt: number;
+  /**
+   * What decided, inside the responding session (#726).
+   *
+   * `responderSessionId` names *where* the decision was made; this names
+   * *what* made it, which is the difference between a human at the parent's
+   * dialog and the parent's policy answering on their behalf.
+   *
+   * Optional for version-skew tolerance: an older responder omits it, and the
+   * requester records the hop with a `null` inner decision rather than
+   * rejecting the answer.
+   */
+  decidedBy?: DecisionSource;
+  /**
+   * How wide a session grant the responder's human chose (#813).
+   *
+   * The child records a subagent-scoped grant itself, so the width has to
+   * survive the hop or the parent's choice is silently narrowed back.
+   * Optional for version-skew tolerance in both directions: an older
+   * responder omits it, and an older requester's allowlist rebuild drops it —
+   * both landing on `"proven"`, the least-privilege width.
+   */
+  sessionGrantWidth?: SessionGrantWidth;
 };
 
 export type PermissionForwardingLocation = {
@@ -168,7 +261,15 @@ export function normalizePermissionForwardingSessionId(
   return trimmed;
 }
 
-function encodeSessionIdForPath(sessionId: string): string {
+/**
+ * Make a session id safe to name a path segment.
+ *
+ * Exported because the forwarding tree has two layouts keyed by session id —
+ * `sessions/<id>/` and the serving-heartbeat records beside it — and a second
+ * encoding would be a silent way for the two to disagree about which file
+ * belongs to which session.
+ */
+export function encodeSessionIdForPath(sessionId: string): string {
   return encodeURIComponent(sessionId);
 }
 
@@ -204,8 +305,31 @@ export function createPermissionForwardingLocation(
   };
 }
 
-export function resolvePermissionForwardingTargetSessionId(options: {
-  hasUI: boolean;
+/**
+ * How a forwarding target was resolved.
+ *
+ * `"registry"` is the load-bearing value: it means the requester is an
+ * **in-process** child of `sessionId`, so the two share a `globalThis` and the
+ * requester may consult the serving-session registry to decide whether anyone
+ * is draining its inbox. `"env"` means the target lives in another process,
+ * where that signal is unavailable.
+ */
+export type PermissionForwardingTargetSource = "registry" | "env";
+
+/** The resolved forwarding target together with how it was found. */
+export interface PermissionForwardingTarget {
+  sessionId: string;
+  source: PermissionForwardingTargetSource;
+}
+
+/**
+ * The session this node relays its asks to, or `null` when it has none.
+ *
+ * Answers only "which *other* session", never "myself": a node that owns its
+ * forwarding location has nothing to resolve, and a request filed into one's
+ * own inbox is drained by no watcher.
+ */
+export function resolvePermissionForwardingTarget(options: {
   isSubagent: boolean;
   currentSessionId?: string | null;
   env?: NodeJS.ProcessEnv;
@@ -213,14 +337,18 @@ export function resolvePermissionForwardingTargetSessionId(options: {
   sessionId?: string;
   /** In-process subagent session registry (checked before env vars). */
   registry?: SubagentSessionRegistry;
-}): string | null {
-  if (options.hasUI) {
-    return normalizePermissionForwardingSessionId(options.currentSessionId);
-  }
-
+}): PermissionForwardingTarget | null {
   if (!options.isSubagent) {
     return null;
   }
+
+  // A candidate naming the requester itself is not a usable target: the
+  // request would land in an inbox this node is not draining, and no other node
+  // would ever answer it. A child's own copy of a subagent extension can
+  // overwrite the spawner's marker with the child's own session id, which is
+  // how such a candidate arises (#907).
+  const own = normalizePermissionForwardingSessionId(options.currentSessionId);
+  const namesAnotherSession = (candidate: string): boolean => candidate !== own;
 
   // 1. Registry — in-process subagents register parentSessionId explicitly.
   if (options.registry && options.sessionId) {
@@ -228,14 +356,18 @@ export function resolvePermissionForwardingTargetSessionId(options: {
     const resolved = normalizePermissionForwardingSessionId(
       entry?.parentSessionId,
     );
-    if (resolved) return resolved;
+    if (resolved && namesAnotherSession(resolved)) {
+      return { sessionId: resolved, source: "registry" };
+    }
   }
 
   // 2. Env vars — process-based subagent extensions.
   const env = options.env ?? process.env;
   for (const key of SUBAGENT_PARENT_SESSION_ENV_CANDIDATES) {
     const resolved = normalizePermissionForwardingSessionId(env[key]);
-    if (resolved) return resolved;
+    if (resolved && namesAnotherSession(resolved)) {
+      return { sessionId: resolved, source: "env" };
+    }
   }
   return null;
 }

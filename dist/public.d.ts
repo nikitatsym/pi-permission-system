@@ -1,19 +1,320 @@
 import { z } from 'zod';
 
-/** Emitted at `session_start`, after the service is published. */
+declare const permissionStateSchema: z.ZodUnion<readonly [z.ZodLiteral<"allow">, z.ZodLiteral<"deny">, z.ZodLiteral<"ask">]>;
+/** A permission decision. */
+type PermissionState = z.infer<typeof permissionStateSchema>;
+
+/**
+ * Provenance of a rule — which source contributed it.
+ *
+ * Config scopes: "global", "project", "agent", "project-agent".
+ * Synthesized:   "builtin" (universal default / evaluate() fallback),
+ *                "baseline" (conditional MCP metadata auto-allow).
+ * Runtime:       "session" (session approvals).
+ * Rewrite:       "yolo" (composition-stage ask→allow rewrite under yolo mode),
+ *                "fail-closed" (composition-stage allow→ask floor when an
+ *                invalid non-global config scope is detected).
+ */
+type RuleOrigin = "global" | "project" | "agent" | "project-agent" | "builtin" | "baseline" | "session" | "yolo" | "fail-closed";
+
+/**
+ * Execution context of a bash command nested inside a substitution or subshell.
+ * Absent for current-shell (top-level) commands.
+ */
+type BashCommandContext = "command_substitution" | "process_substitution" | "subshell";
+/**
+ * Why an indirection wrapper's floor did not apply after all (#803).
+ *
+ * `"core-reader"` — the command the wrapper runs is in the built-in pure-reader
+ * core, so it is read-only for any argument feed and the floor's reason (an
+ * unknown direction behind the wrapper) does not hold.
+ *
+ * `"execution-modifier"` — every wrapper layer (`time`, `timeout`, `nice`,
+ * `stdbuf`, `setsid`) changes only how the visible inner command runs, so the
+ * unit is decided by that command's own rule whatever it does (#963).
+ *
+ * `"no-command"` — the wrapper names no command at all, and its bare form runs
+ * nothing (`env` alone prints the environment), so there is nothing for it to
+ * hide and the unit is decided by its own rule, as `printenv` is.
+ *
+ * A named reason rather than a boolean, so the review log states *why* a
+ * wrapper was let through, and so a later source (a chain verdict, a user
+ * declaration) is an added member rather than a second flag. ADR 0013 §11
+ * keeps both reasons package-audited; user declarations do not lift the floor.
+ */
+type FloorExemption = "core-reader" | "execution-modifier" | "no-command";
+interface PermissionCheckResult {
+    toolName: string;
+    state: PermissionState;
+    /** Custom denial reason from a deny-with-reason pattern, when present. */
+    reason?: string;
+    matchedPattern?: string;
+    command?: string;
+    target?: string;
+    source: "tool" | "bash" | "mcp" | "skill" | "special" | "default" | "session";
+    /** Which source contributed the winning rule. */
+    origin: RuleOrigin;
+    /**
+     * Execution context of the offending nested command, when the winning bash
+     * unit came from a substitution or subshell. Absent for current-shell
+     * (top-level) commands.
+     */
+    commandContext?: BashCommandContext;
+    /**
+     * The command the winning bash unit actually runs, when it is a wrapper whose
+     * inner command differs from the unit text (#713). Display-only: the gate
+     * decides on `command`, and on `executedUnit`'s rules only when
+     * {@link floorExemption} says the wrapper's floor has no reason to hold.
+     */
+    executedUnit?: string;
+    /**
+     * The spelling of the bash unit the winning rule matched, when the rule did
+     * not also match the unit as typed — the absolute spelling of a relative
+     * path argument, say (#910). Display-only: absent whenever the typed text
+     * decided, and dropped by a floor that replaces {@link matchedPattern}.
+     */
+    matchedSpelling?: string;
+    /**
+     * Set when the winning bash unit is a wrapper the floor no longer covers,
+     * naming why (#803, #963). Recorded in the review log so an allow the floor would
+     * once have prompted for is auditable to the reason that let it through.
+     */
+    floorExemption?: FloorExemption;
+    /**
+     * The synthetic pattern of a floor that raised this ask on the bash chain —
+     * on the deciding unit, or on another asking unit of the same command. Only
+     * the child's parse knows it, so a forwarded ask carries it for the serving
+     * node to clamp its own `allow` with.
+     */
+    floor?: string;
+    /**
+     * Every unit of the bash chain that resolved to `ask` and was not
+     * session-granted, in chain order, each with its own floor. Set only on an
+     * asking chain winner: the serving node of a forwarded ask judges each one,
+     * since the winner alone would approve commands it never saw.
+     */
+    askingUnits?: readonly AskingBashUnit[];
+}
+/**
+ * One unit of a bash chain the gate left asking, as the serving node of a
+ * forwarded ask needs it: the unit as typed, and the floor that raised it.
+ */
+interface AskingBashUnit {
+    command: string;
+    floor?: string;
+}
+
+/**
+ * A filesystem effect an access can have.
+ *
+ * ADR 0013 §2 reserves a third value, `delete`, as strictly stronger than
+ * `write`; it is not shipped, so nothing can name it in a config or a proof.
+ */
+type Effect = "read" | "write";
+/**
+ * An effect attribution, including the fail-closed base case.
+ *
+ * `unproven` is not a third effect — it is the absence of a proof, and ADR
+ * 0013 §10 makes it consult both directional surfaces, most-restrictive.
+ */
+type AttributedEffect = Effect | "unproven";
+/**
+ * What established an attribution — the blame fact ADR 0013 §7 asks the review
+ * log to record.
+ *
+ * `retracted` is distinct from `unproven` on purpose: "nobody claimed anything
+ * about `pnpm`" and "`find` is a core reader but `-delete` withdrew the claim"
+ * are different diagnoses, and only the second names a line to read.
+ *
+ * `declared-global` and `declared-project` name the user config scope whose
+ * `commandEffects` entry classified the token, so an allow the declaration
+ * produced is auditable to the file that granted it.
+ */
+type EffectSource = "syntax" | "core" | "declared-global" | "declared-project" | "retracted" | "unproven";
+
+/**
+ * The complete, structured description of a permission ask (ADR 0011 §2).
+ *
+ * A gate emits one of these instead of a sentence. It is complete by contract:
+ * it never truncates and never decides what a human will see. Every consumer is
+ * a renderer over it, eliding under its own budget — so elision is a property
+ * of a render, never of the payload.
+ */
+interface PromptPayload {
+    readonly kind: PromptPayloadKind;
+    readonly request: PromptRequestFacts;
+    /** Complete; each renderer elides to fit its own budget. */
+    readonly evidence: readonly PromptEvidence[];
+    /** Supplied by registered annotators; always marked as model-generated. */
+    readonly annotations: readonly PromptAnnotation[];
+}
+/**
+ * Which ask this payload describes — the renderers' dispatch discriminant.
+ *
+ * Present because the ask shapes are not separable by surface alone: a tool
+ * external-directory ask and a bash one share the `external_directory` surface,
+ * and the `path` gate and the per-tool gate differ only in wording. It gives
+ * every renderer an exhaustive switch rather than a set of string comparisons a
+ * new variant sails past — which is what let the parallel denial-context union
+ * ADR 0011 §7 described dissolve into this one (#746).
+ */
+type PromptPayloadKind = "bash" | "mcp" | "tool" | "path" | "external_directory" | "bash_external_directory" | "skill" | "skill_read" | "forwarded";
+/**
+ * The invariant core (ADR 0011 §3): the facts visible in every render, that no
+ * renderer's budget may elide.
+ *
+ * Named for what it holds — the permission request's own facts, matching the
+ * package's `PermissionRequest` / `ForwardedPermissionRequest` vocabulary —
+ * rather than for its contract, which this comment states instead.
+ */
+interface PromptRequestFacts {
+    /** Who is asking, and whether the ask arrived from a subagent. */
+    readonly requester: PromptRequester;
+    /** The gate surface the rule fired on. */
+    readonly surface: string;
+    /** The gated tool name; `null` when the ask is not tool-shaped. */
+    readonly toolName: string | null;
+    /**
+     * The invoked tool name when a shell alias re-exposes bash under another
+     * name (#574) — "gated as bash, invoked as exec_command" is two facts.
+     * `null` when it adds nothing.
+     */
+    readonly invokedToolName: string | null;
+    /** The decision-relevant value: the command, path, MCP target, or skill name. */
+    readonly value: string;
+    /** The matched rule, including a sentinel such as `<indirection-bash-wrapper>`. */
+    readonly matchedPattern: string | null;
+    /**
+     * For bash, the spelling of the unit the matched rule matched when it did not
+     * match {@link value} as typed — the absolute spelling of a relative path
+     * argument, say. `null` when the typed text decided.
+     */
+    readonly matchedSpelling: string | null;
+    /**
+     * Where the offending bash unit runs, when it came from a substitution or a
+     * subshell. A fact rather than a rendered clause: it is what makes the
+     * matched rule intelligible, and how it reads is the renderer's choice.
+     */
+    readonly commandContext: BashCommandContext | null;
+    /**
+     * For bash, the unit that will actually run — including inside an unstrippable
+     * wrapper (#713). `null` when it adds nothing over {@link value}.
+     */
+    readonly executedUnit: string | null;
+    /**
+     * For a bash path-surface ask, the path that decided it and what established
+     * the direction it was resolved on. `null` for every other ask — a tool's
+     * direction comes from its identity, which the `tool` fact already states.
+     */
+    readonly decidingPath: DecidingPath | null;
+}
+/**
+ * The path that decided a path-surface ask, and what established the direction
+ * it was resolved on — ADR 0013 §10's blame, as a request fact.
+ *
+ * One object rather than three nullable facts, so a path with no effect, or an
+ * effect with no path, is unrepresentable. Bounded — one path and two enums —
+ * which is what lets the review log render it while the full escaping-path
+ * list stays evidence (ADR 0011 §6).
+ */
+interface DecidingPath {
+    /**
+     * As the prompt shows it: the raw token for a `path` ask, the lexical
+     * absolute path for an `external_directory` one.
+     */
+    readonly path: string;
+    readonly effect: AttributedEffect;
+    readonly effectSource: EffectSource;
+}
+/** Who is asking, one hop below when the ask was forwarded. */
+interface PromptRequester {
+    readonly agentName: string | null;
+    readonly forwarded: boolean;
+    /** The requesting session, for a forwarded ask; `null` for a local one. */
+    readonly sessionId: string | null;
+}
+/**
+ * One piece of decision evidence.
+ *
+ * Complete on the payload; each renderer elides entries and orders them under
+ * its own budget (ADR 0011 §4).
+ */
+interface PromptEvidence {
+    readonly label: string;
+    readonly text: string;
+    /**
+     * A secondary fact bound to this entry that a renderer may show alongside
+     * {@link text} or elide independently — a path's symlink-resolved alias, for
+     * instance. Bound to the entry rather than listed as a second one so an
+     * elision cannot separate the two.
+     */
+    readonly detail: string | null;
+}
+/**
+ * A model-generated advisory (ADR 0011 §8).
+ *
+ * The slot owns the attribution and the model-generated marking, so marking is
+ * a property of the payload rather than a discipline each annotator must
+ * remember. Structurally separate from any verdict: an annotation cannot allow,
+ * deny, defer, or suppress.
+ */
+interface PromptAnnotation {
+    readonly source: string;
+    readonly text: string;
+}
+
+/**
+ * Permission event channel — public contract.
+ *
+ * Exports channel name constants, TypeScript types for all emitted events,
+ * and thin emit helpers.
+ *
+ * Stability guarantee: fields may be added, but existing fields will not be
+ * removed or renamed without a semver-major version bump.
+ */
+
+/**
+ * Emitted at `session_start` after the emitting node published its service, and
+ * again at that node's first `before_agent_start` (ADR 0012 decision 3).
+ *
+ * Fires at least once per session and may repeat, so a handler must be
+ * idempotent — registering on every emission hits the duplicate-registration
+ * throw.
+ */
 declare const PERMISSIONS_READY_CHANNEL = "permissions:ready";
 /** Emitted when a permission request is committed to the active UI prompt path. */
 declare const PERMISSIONS_UI_PROMPT_CHANNEL = "permissions:ui_prompt";
 /** Emitted after every permission gate resolution. */
 declare const PERMISSIONS_DECISION_CHANNEL = "permissions:decision";
 /**
- * Payload emitted on `permissions:ready`.
+ * Payload emitted on `permissions:ready`: plain facts about the node that
+ * emitted it (ADR 0012 decision 2).
  *
- * Intentionally empty: the channel is a readiness signal. There is no
- * `protocolVersion` — the published types plus package semver define the
- * broadcast contract.
+ * The bus announces; the locator provides. The payload carries data a consumer
+ * can log, serialize, and replay — never a live capability — so the service
+ * itself is fetched with `getPermissionsService(sessionId)`.
+ *
+ * There is no `protocolVersion` — the published types plus package semver
+ * define the broadcast contract.
  */
-type PermissionsReadyEvent = Record<string, never>;
+interface PermissionsReadyEvent {
+    /**
+     * The emitting node's session id: the key for
+     * `getPermissionsService`. `null` when the host exposed no session
+     * id, in which case this node published no keyed service.
+     */
+    sessionId: string | null;
+    /**
+     * Whether this node adjudicates its own asks (its authorizer chain runs) or
+     * relays them to a serving node, which runs *its* chain over the same facts
+     * (ADR 0007 §7).
+     *
+     * A registration needs no branch on this: extractors and formatters are read
+     * by every node's own gates, and a chain link registered where no chain runs
+     * is accepted and recorded rather than refused (ADR 0012 decision 4).
+     */
+    adjudicatesLocally: boolean;
+}
 /**
  * Origin of a UI prompt.
  *
@@ -50,15 +351,43 @@ interface PermissionUiPromptEvent {
     value: string | null;
     /** Agent name (when known). */
     agentName: string | null;
-    /** Message displayed to the user. */
-    message: string;
+    /**
+     * The ask's invariant core (ADR 0011 §3), verbatim from the prompt payload.
+     *
+     * Nested rather than flattened so the event and the payload share one shape:
+     * a fact added to `PromptRequestFacts` reaches the bus without a second
+     * hand-maintained declaration. Carries no evidence and no annotations — the
+     * bus is the narrowest renderer (ADR 0011 §6), observable by any loaded
+     * extension without the operator having named it.
+     *
+     * `request.surface` is the *gate* surface the rule fired on; the top-level
+     * `surface` is the display projection. Both are here on purpose.
+     */
+    request: PromptRequestFacts;
     /** Forwarding context, or null for a direct prompt. */
     forwarding: ForwardedPromptContext | null;
 }
 /** How a permission decision was reached. */
-type PermissionDecisionResolution = "policy_allow" | "policy_deny" | "session_approved" | "infrastructure_auto_allowed" | "user_approved" | "user_approved_for_session" | "user_denied" | "auto_approved" | "confirmation_unavailable";
+type PermissionDecisionResolution = "policy_allow" | "policy_deny" | "session_approved" | "infrastructure_auto_allowed" | "user_approved" | "user_approved_for_session" | "user_denied" | "auto_approved" | "confirmation_unavailable"
+/**
+ * A human was shown the prompt and nobody answered within the configured
+ * `promptTimeoutMs`, so the request was denied.
+ */
+ | "prompt_unanswered"
+/** A registered `authorizerChain` link granted the ask; no human was asked. */
+ | "authorizer_allowed"
+/** A registered `authorizerChain` link refused the ask; no human was asked. */
+ | "authorizer_denied"
+/** The gate threw, or an escalation failed, and the request was blocked. */
+ | "gate_error";
 /** Payload emitted on `permissions:decision`. */
 interface PermissionDecisionEvent {
+    /**
+     * Identifies the permission request this decision resolves, minted when the
+     * request was created. Distinct from the host's tool-call id: one tool call
+     * runs several gates and so raises several requests.
+     */
+    requestId: string;
     /** Permission surface: "bash", "read", "mcp", "skill", "external_directory", etc. */
     surface: string;
     /** The value that was evaluated (command, tool name, skill name, path). */
@@ -73,59 +402,50 @@ interface PermissionDecisionEvent {
     agentName: string | null;
     /** Matched pattern from the winning rule (when available). */
     matchedPattern: string | null;
+    /**
+     * Forwarding context for a decision this session made while serving another
+     * session's forwarded request; absent on an ordinary local decision.
+     *
+     * The same `ForwardedPromptContext` the request's `permissions:ui_prompt`
+     * carried, so a consumer that never saw the prompt can still tell a served
+     * ask from a local one. Requester identity beyond it — the requester's cwd
+     * and principal — stays off the bus.
+     */
+    forwarding?: ForwardedPromptContext | null;
 }
 
-declare const permissionStateSchema: z.ZodUnion<readonly [z.ZodLiteral<"allow">, z.ZodLiteral<"deny">, z.ZodLiteral<"ask">]>;
-/** A permission decision. */
-type PermissionState = z.infer<typeof permissionStateSchema>;
-
 /**
- * Provenance of a rule — which source contributed it.
+ * One session-approval grant: a wildcard pattern approved on one surface.
  *
- * Config scopes: "global", "project", "agent", "project-agent".
- * Synthesized:   "builtin" (universal default / evaluate() fallback),
- *                "baseline" (conditional MCP metadata auto-allow).
- * Runtime:       "session" (session approvals).
- * Rewrite:       "yolo" (composition-stage ask→allow rewrite under yolo mode).
+ * A gate proves a direction per accessed path (ADR 0013 §7), so an ask whose
+ * paths disagree records a surface per pattern rather than one for all of them
+ * (#810). This lives in its own module because both the {@link SessionApproval}
+ * value object and the forwarded wire type name it, and those two already
+ * import in one direction.
  */
-type RuleOrigin = "global" | "project" | "agent" | "project-agent" | "builtin" | "baseline" | "session" | "yolo";
 
-/**
- * Execution context of a bash command nested inside a substitution or subshell.
- * Absent for current-shell (top-level) commands.
- */
-type BashCommandContext = "command_substitution" | "process_substitution" | "subshell";
-interface PermissionCheckResult {
-    toolName: string;
-    state: PermissionState;
-    /** Custom denial reason from a deny-with-reason pattern, when present. */
-    reason?: string;
-    matchedPattern?: string;
-    command?: string;
-    target?: string;
-    source: "tool" | "bash" | "mcp" | "skill" | "special" | "default" | "session";
-    /** Which source contributed the winning rule. */
-    origin: RuleOrigin;
-    /**
-     * Execution context of the offending nested command, when the winning bash
-     * unit came from a substitution or subshell. Absent for current-shell
-     * (top-level) commands.
-     */
-    commandContext?: BashCommandContext;
+interface ApprovalGrant {
+    readonly surface: string;
+    readonly pattern: string;
 }
 
 /**
  * The child's session-approval suggestion, relayed to the serving node so a
- * human who grants "the whole session" records the same pattern the child
- * would have recorded locally.
+ * human who grants "the whole session" records the same grants the child would
+ * have recorded locally.
  *
  * A plain data shape (not the `SessionApproval` value object) so it serializes
  * onto the forwarded request; the serving node rebuilds a `SessionApproval`
- * from it via `SessionApproval.multiple`.
+ * from it via `SessionApproval.forGrants`.
+ *
+ * Each grant carries its own surface (#810). The pre-#810 shape — one
+ * `surface` plus a `patterns` list — is rejected by the reader rather than
+ * normalized, so a version-skewed pair drops the suggestion and the serving
+ * dialog offers no whole-session scope; the requesting child still records its
+ * own grant, so the failure is narrow in both directions.
  */
 interface ForwardedSessionApproval {
-    surface: string;
-    patterns: readonly string[];
+    grants: readonly ApprovalGrant[];
 }
 /**
  * The child-fixed facts a gate emits: the surface it evaluated and the match
@@ -146,6 +466,30 @@ interface ForwardedAccessFacts {
     matchValues: string[];
     /** `AccessPath.boundaryValue()` (canonical) for a path surface; `null` for a non-path surface. */
     boundaryValue: string | null;
+    /**
+     * The synthetic pattern of a floor that raised a bash ask on the child
+     * (`<indirection-bash-wrapper>`, `<opaque-bash-wrapper>`,
+     * `<unparsed-bash-subtree>`, `<unparseable-bash-command>`). Only the child's
+     * parse knows it, so the serving node clamps its own `allow` with it rather
+     * than recomputing it. Absent when no floor was raised.
+     */
+    floor?: string;
+    /**
+     * Every unit of a bash chain the child left asking, each with its own floor.
+     * `matchValues` names only the chain's winner, and the serving node's answer
+     * approves the whole tool call, so it judges each of these instead. Absent
+     * for a non-bash ask and for a bash ask raised without a chain (the empty
+     * parse), where `matchValues` is the whole command.
+     */
+    askingUnits?: AskingBashUnit[];
+    /**
+     * Set only by the bash external-directory gate, when every path it left
+     * uncovered names nothing on disk below the filesystem root, was located
+     * against a known working directory, and is not a proven write (ADR 0007 §8). The
+     * delegation envelope honors a link's `allow` on the `external_directory`
+     * family only when it is present; absence means unlicensed.
+     */
+    delegationLicense?: "nothing-on-disk";
 }
 
 type PermissionReviewSource = "tool_call" | "skill_input" | "skill_read";
@@ -166,7 +510,15 @@ interface PromptPermissionDetails {
     requestId: string;
     source: PermissionReviewSource;
     agentName: string | null;
-    message: string;
+    /**
+     * The complete structured description of this ask (ADR 0011 §2).
+     *
+     * Required: every ask carries one, and the type is what guarantees it rather
+     * than a convention each gate has to remember. Every consumer — the dialog,
+     * the wire, the broadcast, the review log, the agent-facing denial text — is
+     * a render over it, so no two of them can disagree.
+     */
+    payload: PromptPayload;
     toolCallId?: string;
     toolName?: string;
     skillName?: string;
@@ -193,8 +545,10 @@ interface PromptPermissionDetails {
      * The child-fixed access facts the raising gate computed (surface + match
      * set). Rides through the runner to the escalation edge, which completes
      * them into a `ForwardedAccessIntent` by stamping `requesterCwd` and
-     * `principal`. Absent for a serving-node local prompt reconstructed from a
-     * forwarded request.
+     * `principal`. On a serving node these facts are projected back off the
+     * forwarded request, so a forwarded ask reaches the `Authorizer` chain with
+     * the same evidence as a local one; only a version-skew request that carried
+     * no intent leaves this absent.
      */
     accessIntent?: ForwardedAccessFacts;
 }
@@ -247,16 +601,23 @@ type ToolAccessExtractor = (input: Record<string, unknown>) => string | undefine
 type ToolInputFormatter = (input: Record<string, unknown>) => string | undefined;
 
 /**
- * Cross-extension service accessor backed by `Symbol.for()` on `globalThis`.
+ * Cross-extension service accessors backed by `Symbol.for()` on `globalThis`.
  *
  * `Symbol.for()` is process-global by spec, so it survives jiti's per-extension
  * module isolation (`moduleCache: false`). A consumer doing
- * `import("@gotgenes/pi-permission-system")` gets a fresh module copy, but
- * `getPermissionsService()` reads from the same `globalThis` slot the provider
- * wrote to — enabling direct, synchronous, type-safe function calls.
+ * `import("@gotgenes/pi-permission-system")` gets a fresh module copy, but the
+ * accessors here read from the same `globalThis` slots the provider wrote to —
+ * enabling direct, synchronous, type-safe function calls.
  *
- * Best practice: call `getPermissionsService()` per use rather than caching the
- * reference — this ensures resilience across `/reload` and load-order edge cases.
+ * The slot is a session-keyed map, because one process can host several
+ * **nodes** (one Pi session runtime each — a root session and its in-process
+ * subagent children all load their own instance of this extension). Every node
+ * writes under its own session id, and `getPermissionsService(sessionId)`
+ * resolves the service whose registries that node's own gates and chain read
+ * (ADR 0012 decision 2).
+ *
+ * Best practice: resolve per use rather than caching the reference — this
+ * ensures resilience across `/reload` and load-order edge cases.
  */
 
 /**
@@ -295,12 +656,16 @@ interface PermissionQuery {
      */
     checkPermission(surface: string, value?: string, agentName?: string): PermissionCheckResult;
     /**
-     * Query the tool-level permission state for pre-filtering tools before
-     * creating a child session.
+     * Query a surface's catch-all permission state — its blanket policy.
      *
      * Returns `"deny"` | `"allow"` | `"ask"` based on the composed policy.
      * Does not consider command-level rules (e.g. per-bash-command patterns) —
      * use `checkPermission` for runtime invocation gates.
+     *
+     * This is **not** the question to ask when pre-filtering a tool list: a
+     * partially permissive surface such as `bash: {"*": "deny", "git *": "ask"}`
+     * answers `"deny"` here while `git status` would still be asked about. Use
+     * {@link PermissionsService.isToolFullyDenied} for that.
      *
      * @param toolName  - Tool name (e.g. `"bash"`, `"read"`, `"my-extension:tool"`).
      * @param agentName - Optional agent name for per-agent policy resolution.
@@ -308,13 +673,36 @@ interface PermissionQuery {
     getToolPermission(toolName: string, agentName?: string): PermissionState;
 }
 /**
- * Public interface exposed to other extensions via `getPermissionsService()`.
+ * Public interface exposed to other extensions via
+ * {@link getPermissionsService}.
+ *
+ * Each instance belongs to one node, and its three registration surfaces are
+ * read by that node alone: extractors and formatters by its own gates, chain
+ * links by its own chain. Resolve the service of the node whose behavior you
+ * mean to affect.
  *
  * `checkPermission` takes a surface + optional value + optional agent name,
  * and delegates to `PermissionManager.checkPermission()` with current session
  * rules internally.
  */
 interface PermissionsService extends PermissionQuery {
+    /**
+     * Whether every value under a tool's surface resolves to `deny`.
+     *
+     * This is the question to ask before withholding a tool from a child
+     * session's tool list, and it is not `getToolPermission`: that reports the
+     * surface's own catch-all, so a partially permissive surface such as
+     * `bash: {"*": "deny", "git *": "ask"}` reads as `"deny"` while `git status`
+     * would still be asked about.
+     *
+     * Rule ordering is honored (last-match-wins), so an exception written *after*
+     * a `deny` catch-all keeps the tool reachable and one written *before* it
+     * does not.
+     *
+     * @param toolName  - Tool name (e.g. `"bash"`, `"read"`, `"my-extension:tool"`).
+     * @param agentName - Optional agent name for per-agent policy resolution.
+     */
+    isToolFullyDenied(toolName: string, agentName?: string): boolean;
     /**
      * Register a custom preview formatter for a specific tool name.
      *
@@ -350,6 +738,30 @@ interface PermissionsService extends PermissionQuery {
      */
     registerToolAccessExtractor(toolName: string, extractor: ToolAccessExtractor): () => void;
     /**
+     * The access extractor registered on this node for `toolName`, or
+     * `undefined` when it has none.
+     *
+     * This is the read face of a **fact-shaping** registry, and unlike the
+     * authority surfaces it is meant to be read across a node boundary: an
+     * extractor produces a fact about a call (the path it touches) and decides
+     * nothing, so an in-process child whose own registry has no entry may
+     * resolve an ancestor node's service and use its answer to complete the
+     * child's own fact-gathering (ADR 0012 decision 1).
+     *
+     * The same does not hold for {@link registerAuthorizer}: a link produces a
+     * verdict, and live authority converges at the adjudicating node (ADR 0007
+     * §7). There is deliberately no reader for it.
+     */
+    getToolAccessExtractor(toolName: string): ToolAccessExtractor | undefined;
+    /**
+     * The preview formatter registered on this node for `toolName`, or
+     * `undefined` when it has none.
+     *
+     * Fact-shaping, and cross-node readable for the same reason as
+     * {@link getToolAccessExtractor}.
+     */
+    getToolInputFormatter(toolName: string): ToolInputFormatter | undefined;
+    /**
      * Register a named live-authority chain link (ADR 0007 §4).
      *
      * A link reviews an `ask` and returns `allow` / `deny` (with an optional
@@ -374,34 +786,40 @@ interface PermissionsService extends PermissionQuery {
     registerAuthorizer(name: string, authorize: Authorizer["authorize"]): () => void;
 }
 /**
- * Store a `PermissionsService` on `globalThis` so other extensions can
- * retrieve it via `getPermissionsService()`.
+ * Publish `service` as the service of the node whose session is `sessionId`
+ * (ADR 0012 decision 2 — node-locality).
  *
- * Called at `session_start` by the top-level (parent) instance only — an
- * in-process subagent child skips publishing so it cannot clobber the parent's
- * service. Overwrites any previously published service, which keeps `/reload`
- * working: a reloaded parent re-publishes its fresh service.
+ * Every node publishes under its own key, including an in-process subagent
+ * child, so there is nothing to clobber: a child's sibling extension registers
+ * an extractor, formatter, or chain link into the registry the child's own
+ * gates and chain read.
  */
-declare function publishPermissionsService(service: PermissionsService): void;
+declare function publishPermissionsService(sessionId: string, service: PermissionsService): void;
 /**
- * Retrieve the published `PermissionsService`, or `undefined` if the
- * permission-system extension has not loaded (or has been unloaded).
+ * Retrieve the service belonging to the node whose session is `sessionId`, or
+ * `undefined` when that node has published none.
+ *
+ * This is the supported way to obtain a node's service, for registration and
+ * for policy queries alike. Take `sessionId` from the `permissions:ready`
+ * payload (or from `ctx.sessionManager.getSessionId()` inside your own session
+ * handler), and resolve per use rather than caching the reference.
+ *
+ * A caller the type checker cannot reach — JavaScript, or a consumer compiled
+ * against an earlier major — may still call this with no argument. That answers
+ * `undefined` rather than another node's service, and warns once so the missing
+ * registration is not silent.
  */
-declare function getPermissionsService(): PermissionsService | undefined;
+declare function getPermissionsService(sessionId: string): PermissionsService | undefined;
 /**
- * Remove `service` from `globalThis`, but only when the current slot still
- * holds it (identity compare-and-delete).
+ * Remove the `sessionId` entry, but only when it still holds `service`
+ * (identity compare-and-delete).
  *
- * Called during `session_shutdown` to avoid stale references after the
- * extension is torn down. Scoping the delete to the publishing instance keeps
- * two cases correct:
- *
- * - An in-process subagent child never published the parent's service, so its
- *   shutdown is a no-op and the parent's slot survives.
- * - A superseded `/reload` generation no longer owns the slot, so its late
- *   shutdown cannot wipe the new generation's freshly published service.
+ * Called during `session_shutdown` to avoid stale references after the node is
+ * torn down. Scoping the delete to the publishing instance keeps a superseded
+ * `/reload` generation's late shutdown from wiping the new generation's freshly
+ * published service.
  */
-declare function unpublishPermissionsService(service: PermissionsService): void;
+declare function unpublishPermissionsService(sessionId: string, service: PermissionsService): void;
 
 export { PERMISSIONS_DECISION_CHANNEL, PERMISSIONS_READY_CHANNEL, PERMISSIONS_UI_PROMPT_CHANNEL, getPermissionsService, publishPermissionsService, unpublishPermissionsService };
-export type { Authorizer, AuthorizerLog, AuthorizerVerdict, ForwardedPromptContext, PermissionCheckResult, PermissionDecisionEvent, PermissionQuery, PermissionState, PermissionUiPromptEvent, PermissionUiPromptSource, PermissionsReadyEvent, PermissionsService, PromptPermissionDetails, ToolInputFormatter };
+export type { Authorizer, AuthorizerLog, AuthorizerVerdict, DecidingPath, ForwardedPromptContext, PermissionCheckResult, PermissionDecisionEvent, PermissionQuery, PermissionState, PermissionUiPromptEvent, PermissionUiPromptSource, PermissionsReadyEvent, PermissionsService, PromptAnnotation, PromptEvidence, PromptPayload, PromptPayloadKind, PromptPermissionDetails, PromptRequestFacts, PromptRequester, ToolInputFormatter };
