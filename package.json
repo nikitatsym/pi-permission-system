@@ -1,7 +1,7 @@
 {
   "name": "@gotgenes/pi-permission-system",
-  "version": "42.0.0",
-  "description": "Permission enforcement extension for the Pi coding agent.",
+  "version": "42.0.1",
+  "description": "Permission enforcement extension for the Pi coding agent, forked with an omp (oh-my-pi) patch.",
   "type": "module",
   "exports": {
     ".": {
@@ -44,12 +44,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gotgenes/pi-packages.git",
-    "directory": "packages/pi-permission-system"
+    "url": "git+https://github.com/nikitatsym/pi-permission-system.git"
   },
-  "homepage": "https://github.com/gotgenes/pi-packages/tree/main/packages/pi-permission-system#readme",
+  "homepage": "https://github.com/nikitatsym/pi-permission-system#readme",
   "bugs": {
-    "url": "https://github.com/gotgenes/pi-packages/issues"
+    "url": "https://github.com/nikitatsym/pi-permission-system/issues"
   },
   "engines": {
     "node": ">=22"
