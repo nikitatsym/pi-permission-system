@@ -1,5 +1,10 @@
 import { getNonEmptyString, toRecord } from "#src/value-guards";
-import { countTextLines, formatCount } from "./tool-input-preview";
+import {
+  countTextLines,
+  formatCount,
+  TOOL_INPUT_PREVIEW_MAX_LENGTH,
+  truncateInlineText,
+} from "./tool-input-preview";
 
 export function getPromptPath(input: Record<string, unknown>): string | null {
   return getNonEmptyString(input.path) ?? getNonEmptyString(input.file_path);
@@ -44,6 +49,13 @@ export function formatWriteInputForPrompt(
 ): string {
   const path = getPromptPath(input);
   const content = typeof input.content === "string" ? input.content : "";
+  // An xd:// write's content is the device command: a reviewer must see it, not its size.
+  if (path?.startsWith("xd://")) {
+    const inline = content.replace(/\s+/g, " ").trim();
+    return inline
+      ? `for '${path}' with content ${truncateInlineText(inline, TOOL_INPUT_PREVIEW_MAX_LENGTH)}`
+      : `for '${path}' with empty content`;
+  }
   const summary = `(${formatCount(countTextLines(content), "line", "lines")}, ${formatCount(content.length, "character", "characters")})`;
   return path ? `for '${path}' ${summary}` : summary;
 }
